@@ -190,6 +190,7 @@ class CaptchaConfig(BaseModel):
     remote_browser_timeout: int = 60
     website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
     page_action: str = "IMAGE_GENERATION"
+    video_page_action: str = "VIDEO_GENERATION"
     browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理
     browser_proxy_url: Optional[str] = None  # 浏览器打码代理URL
     browser_count: int = 1  # 浏览器打码实例数量

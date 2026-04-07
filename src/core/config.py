@@ -378,6 +378,38 @@ class Config:
         )
 
     @property
+    def captcha_page_action(self) -> str:
+        """Get image reCAPTCHA action."""
+        return (
+            str(self._config.get("captcha", {}).get("page_action", "IMAGE_GENERATION") or "").strip()
+            or "IMAGE_GENERATION"
+        )
+
+    def set_captcha_page_action(self, page_action: str):
+        """Set image reCAPTCHA action."""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["page_action"] = (
+            str(page_action or "").strip() or "IMAGE_GENERATION"
+        )
+
+    @property
+    def captcha_video_page_action(self) -> str:
+        """Get video reCAPTCHA action."""
+        return (
+            str(self._config.get("captcha", {}).get("video_page_action", "VIDEO_GENERATION") or "").strip()
+            or "VIDEO_GENERATION"
+        )
+
+    def set_captcha_video_page_action(self, page_action: str):
+        """Set video reCAPTCHA action."""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["video_page_action"] = (
+            str(page_action or "").strip() or "VIDEO_GENERATION"
+        )
+
+    @property
     def browser_launch_background(self) -> bool:
         """有头浏览器打码是否默认后台启动，避免抢占前台窗口。"""
         return self._config.get("captcha", {}).get("browser_launch_background", True)

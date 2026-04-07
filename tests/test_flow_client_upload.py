@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock
 
+from src.core.config import config
 from src.services.flow_client import FlowClient
 
 
@@ -97,6 +98,23 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             "projectId",
             request_calls[1]["json_data"]["clientContext"],
         )
+
+
+class FlowClientCaptchaActionTests(unittest.TestCase):
+    def test_resolve_captcha_action_uses_runtime_overrides(self):
+        client = FlowClient(proxy_manager=None)
+        old_page_action = config.captcha_page_action
+        old_video_page_action = config.captcha_video_page_action
+
+        try:
+            config.set_captcha_page_action("PINHOLE_IMAGE")
+            config.set_captcha_video_page_action("PINHOLE_VIDEO")
+
+            self.assertEqual(client._resolve_captcha_action("IMAGE_GENERATION"), "PINHOLE_IMAGE")
+            self.assertEqual(client._resolve_captcha_action("VIDEO_GENERATION"), "PINHOLE_VIDEO")
+        finally:
+            config.set_captcha_page_action(old_page_action)
+            config.set_captcha_video_page_action(old_video_page_action)
 
 
 if __name__ == "__main__":

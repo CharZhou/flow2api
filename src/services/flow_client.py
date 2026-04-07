@@ -2279,7 +2279,7 @@ class FlowClient:
             return False
 
         normalized_project = str(project_id or "").strip()
-        normalized_action = str(action or "IMAGE_GENERATION").strip() or "IMAGE_GENERATION"
+        normalized_action = self._resolve_captcha_action(action)
         if not normalized_project:
             return False
 
@@ -2333,6 +2333,15 @@ class FlowClient:
         target_timeout = 45 if action_name == "VIDEO_GENERATION" else 35
         return max(12, min(base_timeout, target_timeout))
 
+    def _resolve_captcha_action(self, action: str) -> str:
+        """Map logical image/video action names to runtime-configured upstream actions."""
+        normalized_action = str(action or "").strip().upper() or "IMAGE_GENERATION"
+        if normalized_action == "VIDEO_GENERATION":
+            return getattr(config, "captcha_video_page_action", "VIDEO_GENERATION")
+        if normalized_action == "IMAGE_GENERATION":
+            return getattr(config, "captcha_page_action", "IMAGE_GENERATION")
+        return normalized_action
+
     async def _get_recaptcha_token(
         self,
         project_id: str,
@@ -2355,7 +2364,11 @@ class FlowClient:
             - 其他模式: browser_id 为 None
         """
         captcha_method = config.captcha_method
-        debug_logger.log_info(f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, action={action}")
+        resolved_action = self._resolve_captcha_action(action)
+        debug_logger.log_info(
+            f"[reCAPTCHA] 开始获取 token: method={captcha_method}, project_id={project_id}, "
+            f"action={action}, resolved_action={resolved_action}"
+        )
 
         # 内置浏览器打码 (nodriver)
         if captcha_method == "personal":
@@ -2365,7 +2378,7 @@ class FlowClient:
                 debug_logger.log_info(f"[reCAPTCHA] 导入 BrowserCaptchaService 成功")
                 service = await BrowserCaptchaService.get_instance(self.db)
                 debug_logger.log_info(f"[reCAPTCHA] 获取服务实例成功，准备调用 get_token")
-                token = await service.get_token(project_id, action)
+                token = await service.get_token(project_id, resolved_action)
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
                 fingerprint = service.get_last_fingerprint() if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
@@ -2391,7 +2404,7 @@ class FlowClient:
             try:
                 from .browser_captcha import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
-                token, browser_id = await service.get_token(project_id, action, token_id=token_id)
+                token, browser_id = await service.get_token(project_id, resolved_action, token_id=token_id)
                 fingerprint = await service.get_fingerprint(browser_id) if token else None
                 self._set_request_fingerprint(fingerprint if token else None)
                 return token, browser_id
@@ -2413,13 +2426,13 @@ class FlowClient:
                 return None, None
         elif captcha_method == "remote_browser":
             try:
-                solve_timeout = self._resolve_remote_browser_solve_timeout(action)
+                solve_timeout = self._resolve_remote_browser_solve_timeout(resolved_action)
                 payload = await self._call_remote_browser_service(
                     method="POST",
                     path="/api/v1/solve",
                     json_data={
                         "project_id": project_id,
-                        "action": action,
+                        "action": resolved_action,
                         "token_id": token_id,
                     },
                     timeout_override=solve_timeout,
@@ -2438,7 +2451,7 @@ class FlowClient:
         # API打码服务
         elif captcha_method in ["yescaptcha", "capmonster", "ezcaptcha", "capsolver"]:
             self._set_request_fingerprint(None)
-            token = await self._get_api_captcha_token(captcha_method, project_id, action)
+            token = await self._get_api_captcha_token(captcha_method, project_id, resolved_action)
             return token, None
         else:
             debug_logger.log_info(f"[reCAPTCHA] 未知的打码方式: {captcha_method}")
