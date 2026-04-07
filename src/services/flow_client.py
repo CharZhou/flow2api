@@ -6,6 +6,7 @@ import time
 import uuid
 import random
 import base64
+import re
 import ssl
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
 from urllib.parse import quote
