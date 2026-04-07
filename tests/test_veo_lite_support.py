@@ -62,9 +62,10 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_video_text_uses_v2_payload_for_lite(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token):
+        async def fake_make_request(method, url, json_data, use_at, at_token, headers=None):
             captured["url"] = url
             captured["json_data"] = json_data
+            captured["headers"] = headers or {}
             return {"operations": [{"operation": {"name": "task-1"}}]}
 
         self.client._make_request = AsyncMock(side_effect=fake_make_request)
@@ -88,13 +89,15 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("prompt", request_data["textInput"])
         self.assertEqual(request_data["videoModelKey"], "veo_3_1_t2v_lite")
+        self.assertEqual(captured["headers"].get("Content-Type"), "text/plain;charset=UTF-8")
 
     async def test_generate_video_start_end_uses_v2_payload_for_interpolation_lite(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token):
+        async def fake_make_request(method, url, json_data, use_at, at_token, headers=None):
             captured["url"] = url
             captured["json_data"] = json_data
+            captured["headers"] = headers or {}
             return {"operations": [{"operation": {"name": "task-2"}}]}
 
         self.client._make_request = AsyncMock(side_effect=fake_make_request)
@@ -121,6 +124,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
             request_data["textInput"]["structuredPrompt"]["parts"][0]["text"],
             "变身猫猫",
         )
+        self.assertEqual(captured["headers"].get("Origin"), "https://labs.google")
 
 
 if __name__ == "__main__":

@@ -40,19 +40,12 @@ class FlowClient:
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
 
-        # Default "real browser" headers (Android Chrome style) to reduce upstream 4xx/5xx instability.
-        # These will be applied as defaults (won't override caller-provided headers).
+        # Browser-like fetch metadata headers. Keep these conservative and avoid
+        # inventing unstable Google-internal headers unless they come from a real browser.
         self._default_client_headers = {
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": "\"Android\"",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "x-browser-channel": "stable",
-            "x-browser-copyright": "Copyright 2026 Google LLC. All Rights reserved.",
-            "x-browser-validation": "UujAs0GAwdnCJ9nvrswZ+O+oco0=",
-            "x-browser-year": "2026",
-            "x-client-data": "CJS2yQEIpLbJAQipncoBCNj9ygEIlKHLAQiFoM0BGP6lzwE="
         }
         # 发车策略改为“请求到就发”：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
@@ -166,6 +159,51 @@ class FlowClient:
             return "chrome124"
         return "chrome120"
 
+    def _guess_client_hints_from_user_agent(self, user_agent: Optional[str]) -> Dict[str, str]:
+        """根据 UA 推断常见 sec-ch-* 头，避免与声明浏览器明显错位。"""
+        ua = (user_agent or "").strip()
+        if not ua:
+            return {}
+
+        headers: Dict[str, str] = {}
+        major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
+        is_mobile = any(token in ua for token in ("Android", "iPhone", "iPad", "Mobile"))
+        headers["sec-ch-ua-mobile"] = "?1" if is_mobile else "?0"
+
+        if "Windows" in ua:
+            headers["sec-ch-ua-platform"] = '"Windows"'
+        elif "Macintosh" in ua or "Mac OS X" in ua:
+            headers["sec-ch-ua-platform"] = '"macOS"'
+        elif "Android" in ua:
+            headers["sec-ch-ua-platform"] = '"Android"'
+        elif "iPhone" in ua or "iPad" in ua:
+            headers["sec-ch-ua-platform"] = '"iOS"'
+        elif "Linux" in ua:
+            headers["sec-ch-ua-platform"] = '"Linux"'
+
+        if major_match:
+            major = major_match.group(1)
+            if "Edg/" in ua:
+                headers["sec-ch-ua"] = (
+                    f'"Chromium";v="{major}", "Not-A.Brand";v="24", "Microsoft Edge";v="{major}"'
+                )
+            else:
+                headers["sec-ch-ua"] = (
+                    f'"Chromium";v="{major}", "Not-A.Brand";v="24", "Google Chrome";v="{major}"'
+                )
+
+        return headers
+
+    def _build_generation_request_headers(self) -> Dict[str, str]:
+        """Build browser-like headers for media generation submit requests."""
+        return {
+            "Accept": "*/*",
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Origin": "https://labs.google",
+            "Referer": "https://labs.google/",
+            "priority": "u=1, i",
+        }
+
     def _set_request_fingerprint(self, fingerprint: Optional[Dict[str, Any]]):
         """设置当前请求链路的浏览器指纹上下文。"""
         self._request_fingerprint_ctx.set(dict(fingerprint) if fingerprint else None)
@@ -252,10 +290,8 @@ class FlowClient:
         if isinstance(fingerprint, dict):
             fingerprint_user_agent = fingerprint.get("user_agent")
 
-        headers.update({
-            "Content-Type": "application/json",
-            "User-Agent": fingerprint_user_agent or self._generate_user_agent(account_id)
-        })
+        headers.setdefault("Content-Type", "application/json")
+        headers.setdefault("User-Agent", fingerprint_user_agent or self._generate_user_agent(account_id))
 
         # 若存在打码浏览器指纹，覆盖关键客户端提示头，保证提交请求与打码时一致。
         if isinstance(fingerprint, dict):
@@ -267,6 +303,9 @@ class FlowClient:
                 headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
             if fingerprint.get("sec_ch_ua_platform"):
                 headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
+        else:
+            for key, value in self._guess_client_hints_from_user_agent(headers.get("User-Agent")).items():
+                headers.setdefault(key, value)
 
         # Add default Chromium/Android client headers (do not override explicitly provided values).
         for key, value in self._default_client_headers.items():
@@ -302,10 +341,14 @@ class FlowClient:
                         impersonate=impersonate
                     )
                 else:  # POST
+                    request_body = json_data
+                    if str(headers.get("Content-Type", "")).lower().startswith("text/plain"):
+                        request_body = json.dumps(json_data or {}, ensure_ascii=False, separators=(",", ":"))
                     response = await session.post(
                         url,
                         headers=headers,
-                        json=json_data,
+                        data=request_body if isinstance(request_body, str) else None,
+                        json=None if isinstance(request_body, str) else request_body,
                         proxy=proxy_url,
                         timeout=request_timeout,
                         impersonate=impersonate
@@ -422,8 +465,11 @@ class FlowClient:
 
         data = None
         if method.upper() != "GET" and json_data is not None:
-            data = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
-            request_headers["Content-Type"] = "application/json"
+            if str(request_headers.get("Content-Type", "")).lower().startswith("text/plain"):
+                data = json.dumps(json_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            else:
+                data = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
+                request_headers.setdefault("Content-Type", "application/json")
 
         handlers = [urllib.request.HTTPSHandler(context=ssl.create_default_context())]
         if proxy_url:
@@ -531,7 +577,8 @@ class FlowClient:
         url: str,
         json_data: Dict[str, Any],
         at: str,
-        attempt_trace: Optional[Dict[str, Any]] = None
+        attempt_trace: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """图片生成请求使用更短超时，并在网络超时时快速重试。"""
         request_timeout = config.flow_image_request_timeout
@@ -585,6 +632,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=headers,
                     json_data=json_data,
                     use_at=True,
                     at_token=at,
@@ -1091,6 +1139,7 @@ class FlowClient:
                     json_data=json_data,
                     at=at,
                     attempt_trace=attempt_trace,
+                    headers=self._build_generation_request_headers(),
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
@@ -1191,6 +1240,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at,
@@ -1338,6 +1388,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at
@@ -1468,6 +1519,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at
@@ -1601,6 +1653,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at
@@ -1730,6 +1783,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at
@@ -1847,6 +1901,7 @@ class FlowClient:
                 result = await self._make_request(
                     method="POST",
                     url=url,
+                    headers=self._build_generation_request_headers(),
                     json_data=json_data,
                     use_at=True,
                     at_token=at
