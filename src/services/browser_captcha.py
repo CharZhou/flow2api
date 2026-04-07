@@ -1251,6 +1251,7 @@ class TokenBrowser:
         website_key: str,
         action: str,
         keep_page_open: bool = False,
+        session_token: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[Any]]:
         """在给定 context 中执行打码逻辑"""
         page = None
@@ -1259,43 +1260,12 @@ class TokenBrowser:
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
-            # 使用更简单的 API 地址，避免加载复杂页面
-            page_url = "https://labs.google/fx/api/auth/providers"
             primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
             secondary_host = "https://www.google.com" if primary_host == "https://www.recaptcha.net" else "https://www.recaptcha.net"
-            debug_logger.log_info(
-                f"[BrowserCaptcha] Token-{self.token_id} 加载 enterprise.js: primary={primary_host}, secondary={secondary_host}"
-            )
-            
-            async def handle_route(route):
-                if route.request.url.rstrip('/') == page_url.rstrip('/'):
-                    html = f"""<html><head><script>
-                    (() => {{
-                        const urls = [
-                            '{primary_host}/recaptcha/enterprise.js?render={website_key}',
-                            '{secondary_host}/recaptcha/enterprise.js?render={website_key}'
-                        ];
-                        const loadScript = (index) => {{
-                            if (index >= urls.length) return;
-                            const script = document.createElement('script');
-                            script.src = urls[index];
-                            script.async = true;
-                            script.onerror = () => loadScript(index + 1);
-                            document.head.appendChild(script);
-                        }};
-                        loadScript(0);
-                    }})();
-                    </script></head><body></body></html>"""
-                    await route.fulfill(status=200, content_type="text/html", body=html)
-                elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net", "aisandbox-pa.googleapis.com"]):
-                    await route.continue_()
-                else:
-                    await route.abort()
-
             def handle_request_failed(request):
                 try:
                     failed_url = request.url or ""
-                    if not any(d in failed_url for d in ["google.com", "gstatic.com", "recaptcha.net"]):
+                    if not any(d in failed_url for d in ["google.com", "gstatic.com", "recaptcha.net", "labs.google", "aisandbox-pa.googleapis.com"]):
                         return
                     failure = request.failure or ""
                     debug_logger.log_warning(
@@ -1303,20 +1273,130 @@ class TokenBrowser:
                     )
                 except Exception:
                     pass
-            
-            await page.route("**/*", handle_route)
+
             page.on("requestfailed", handle_request_failed)
-            try:
-                await page.goto(page_url, wait_until="load", timeout=15000)  # 减少到15秒
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} page.goto 失败: {type(e).__name__}: {str(e)[:200]}")
-                return None
+
+            used_real_project_page = False
+            if session_token:
+                try:
+                    await context.clear_cookies()
+                except Exception:
+                    pass
+                try:
+                    await context.add_cookies([
+                        {
+                            "name": "__Secure-next-auth.session-token",
+                            "value": session_token,
+                            "url": "https://labs.google",
+                            "secure": True,
+                        }
+                    ])
+                    project_page_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+                    debug_logger.log_info(
+                        f"[BrowserCaptcha] Token-{self.token_id} 在真实项目页执行打码: {project_page_url}"
+                    )
+                    await page.goto(project_page_url, wait_until="domcontentloaded", timeout=30000)
+                    for _ in range(20):
+                        try:
+                            ready_state = await page.evaluate("document.readyState")
+                            if ready_state == "complete":
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                    used_real_project_page = True
+                except Exception as e:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] Token-{self.token_id} 真实项目页打码准备失败，回退简化页: {type(e).__name__}: {str(e)[:200]}"
+                    )
+
+            if not used_real_project_page:
+                page_url = "https://labs.google/fx/api/auth/providers"
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] Token-{self.token_id} 加载 enterprise.js: primary={primary_host}, secondary={secondary_host}"
+                )
+
+                async def handle_route(route):
+                    if route.request.url.rstrip('/') == page_url.rstrip('/'):
+                        html = f"""<html><head><script>
+                        (() => {{
+                            const urls = [
+                                '{primary_host}/recaptcha/enterprise.js?render={website_key}',
+                                '{secondary_host}/recaptcha/enterprise.js?render={website_key}'
+                            ];
+                            const loadScript = (index) => {{
+                                if (index >= urls.length) return;
+                                const script = document.createElement('script');
+                                script.src = urls[index];
+                                script.async = true;
+                                script.onerror = () => loadScript(index + 1);
+                                document.head.appendChild(script);
+                            }};
+                            loadScript(0);
+                        }})();
+                        </script></head><body></body></html>"""
+                        await route.fulfill(status=200, content_type="text/html", body=html)
+                    elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net", "aisandbox-pa.googleapis.com"]):
+                        await route.continue_()
+                    else:
+                        await route.abort()
+
+                await page.route("**/*", handle_route)
+                try:
+                    await page.goto(page_url, wait_until="load", timeout=15000)
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} page.goto 失败: {type(e).__name__}: {str(e)[:200]}")
+                    return None, None
 
             try:
-                await page.wait_for_function("typeof grecaptcha !== 'undefined'", timeout=10000)  # 减少到10秒
-            except Exception as e:
-                debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} grecaptcha 未就绪: {type(e).__name__}: {str(e)[:200]}")
-                return None
+                await page.wait_for_function(
+                    "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'",
+                    timeout=15000,
+                )
+            except Exception:
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] Token-{self.token_id} grecaptcha 未就绪，尝试补注入 enterprise.js"
+                )
+                try:
+                    await page.evaluate(
+                        """
+                            (primaryUrl, secondaryUrl) => {
+                                const existing = Array.from(document.scripts || []).some((script) => {
+                                    const src = script?.src || "";
+                                    return src.includes("/recaptcha/");
+                                });
+                                if (existing) return;
+                                const urls = [primaryUrl, secondaryUrl];
+                                const loadScript = (index) => {
+                                    if (index >= urls.length) return;
+                                    const script = document.createElement("script");
+                                    script.src = urls[index];
+                                    script.async = true;
+                                    script.onerror = () => loadScript(index + 1);
+                                    document.head.appendChild(script);
+                                };
+                                loadScript(0);
+                            }
+                        """,
+                        f"{primary_host}/recaptcha/enterprise.js?render={website_key}",
+                        f"{secondary_host}/recaptcha/enterprise.js?render={website_key}",
+                    )
+                    await page.wait_for_function(
+                        "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'",
+                        timeout=15000,
+                    )
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} grecaptcha 最终未就绪: {type(e).__name__}: {str(e)[:200]}")
+                    return None, None
+
+            if used_real_project_page:
+                try:
+                    await page.mouse.move(320, 220)
+                    await page.mouse.move(520, 320, steps=10)
+                    await page.mouse.wheel(0, 240)
+                    await page.bring_to_front()
+                except Exception:
+                    pass
 
             # 记录本次打码页面的真实 UA/客户端提示头
             await self._capture_page_fingerprint(page)
@@ -1573,7 +1653,8 @@ class TokenBrowser:
         project_id: str,
         website_key: str,
         action: str = "IMAGE_GENERATION",
-        token_proxy_url: Optional[str] = None
+        token_proxy_url: Optional[str] = None,
+        session_token: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """Get a token from the shared browser unless a fatal browser error occurs."""
         async with self._semaphore:
@@ -1592,6 +1673,7 @@ class TokenBrowser:
                             website_key,
                             action,
                             keep_page_open=True,
+                            session_token=session_token,
                         )
                         if token:
                             self._solve_count += 1
@@ -2027,17 +2109,22 @@ class BrowserCaptchaService:
 
         return None, None
 
-    async def _resolve_token_proxy_url(self, token_id: Optional[int]) -> Optional[str]:
-        """读取 token 级打码代理，为空时回退全局配置。"""
+    async def _resolve_token_runtime_context(self, token_id: Optional[int]) -> tuple[Optional[str], Optional[str]]:
+        """读取 token 级浏览器运行上下文，包括代理和 ST。"""
         if not token_id or not self.db:
-            return None
+            return None, None
         try:
             token = await self.db.get_token(token_id)
-            if token and token.captcha_proxy_url and token.captcha_proxy_url.strip():
-                return token.captcha_proxy_url.strip()
+            if not token:
+                return None, None
+            proxy_url = None
+            if token.captcha_proxy_url and token.captcha_proxy_url.strip():
+                proxy_url = token.captcha_proxy_url.strip()
+            session_token = str(token.st or "").strip() or None
+            return proxy_url, session_token
         except Exception as e:
-            debug_logger.log_warning(f"[BrowserCaptcha] 读取 token({token_id}) 打码代理失败: {e}")
-        return None
+            debug_logger.log_warning(f"[BrowserCaptcha] 读取 token({token_id}) 运行上下文失败: {e}")
+            return None, None
     
     async def get_token(self, project_id: str, action: str = "IMAGE_GENERATION", token_id: int = None) -> tuple[Optional[str], Union[int, str]]:
         """获取 reCAPTCHA Token（从共享浏览器池选择 slot）
@@ -2054,7 +2141,7 @@ class BrowserCaptchaService:
         self._check_available()
         
         self._stats["req_total"] += 1
-        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        token_proxy_url, session_token = await self._resolve_token_runtime_context(token_id)
         
         token: Optional[str] = None
         request_ref: Optional[str] = None
@@ -2069,7 +2156,8 @@ class BrowserCaptchaService:
                         project_id,
                         self.website_key,
                         action,
-                        token_proxy_url=token_proxy_url
+                        token_proxy_url=token_proxy_url,
+                        session_token=session_token,
                     )
                 finally:
                     await self._release_slot_reservation(browser_id)
@@ -2089,7 +2177,8 @@ class BrowserCaptchaService:
                 project_id,
                 self.website_key,
                 action,
-                token_proxy_url=token_proxy_url
+                token_proxy_url=token_proxy_url,
+                session_token=session_token,
             )
         finally:
             await self._release_slot_reservation(browser_id)
