@@ -58,6 +58,15 @@ ALLOW_DOCKER_HEADED = (
 DOCKER_HEADED_BLOCKED = IS_DOCKER and not ALLOW_DOCKER_HEADED
 
 
+def _run_text_subprocess(cmd, **kwargs):
+    """Run subprocess text capture with a stable cross-platform decoder."""
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(cmd, **kwargs)
+
+
 # ==================== playwright 自动安装 ====================
 def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     """运行 pip install 命令"""
@@ -68,7 +77,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
         print(f"[BrowserCaptcha] 正在安装 {package}...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = _run_text_subprocess(cmd, timeout=300)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
             print(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -93,7 +102,7 @@ def _run_playwright_install(use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info("[BrowserCaptcha] 正在安装 chromium 浏览器...")
         print("[BrowserCaptcha] 正在安装 chromium 浏览器...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        result = _run_text_subprocess(cmd, timeout=600, env=env)
         if result.returncode == 0:
             debug_logger.log_info("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
             print("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
@@ -143,10 +152,8 @@ def _ensure_browser_installed() -> bool:
         )
         env = os.environ.copy()
         env.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "0") or "0")
-        result = subprocess.run(
+        result = _run_text_subprocess(
             [sys.executable, "-c", detect_script],
-            capture_output=True,
-            text=True,
             timeout=60,
             env=env,
         )
@@ -438,6 +445,8 @@ class TokenBrowser:
             if sys.platform.startswith('win'):
                 result = subprocess.run(
                     ['tasklist', '/FI', f'PID eq {pid}'],
+                    encoding="utf-8",
+                    errors="replace",
                     capture_output=True,
                     text=True,
                     timeout=10,
@@ -454,15 +463,13 @@ class TokenBrowser:
         marker = self._get_slot_marker()
         try:
             if sys.platform.startswith('win'):
-                result = subprocess.run(
+                result = _run_text_subprocess(
                     [
                         'powershell',
                         '-NoProfile',
                         '-Command',
                         f'(Get-CimInstance Win32_Process -Filter "ProcessId = {pid}").CommandLine'
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=15,
                 )
                 command_line = (result.stdout or '').strip()
@@ -498,6 +505,8 @@ class TokenBrowser:
                     ['taskkill', '/PID', str(pid), '/T', '/F'],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=15,
                 )
             else:
@@ -1624,7 +1633,7 @@ class BrowserCaptchaService:
     
     def __init__(self, db=None):
         self.db = db
-        self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        self.website_key = getattr(config, "captcha_website_key", "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
         self.base_user_data_dir = os.path.join(os.getcwd(), "browser_data_rt")
         self._browsers: Dict[int, TokenBrowser] = {}
         self._browsers_lock = asyncio.Lock()
@@ -1709,6 +1718,7 @@ class BrowserCaptchaService:
             try:
                 captcha_config = await self.db.get_captcha_config()
                 self._browser_count = max(1, captcha_config.browser_count)
+                self.website_key = (getattr(captcha_config, "website_key", "") or self.website_key).strip() or self.website_key
                 debug_logger.log_info(f"[BrowserCaptcha] 浏览器数量配置: {self._browser_count}")
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] 加载 browser_count 配置失败: {e}，使用默认值 1")
@@ -2118,4 +2128,3 @@ class BrowserCaptchaService:
             "browsers": []
         }
         return base_stats
-

@@ -59,6 +59,15 @@ ALLOW_DOCKER_HEADED = (
 DOCKER_HEADED_BLOCKED = IS_DOCKER and not ALLOW_DOCKER_HEADED
 
 
+def _run_text_subprocess(cmd, **kwargs):
+    """Run subprocess text capture with a stable cross-platform decoder."""
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(cmd, **kwargs)
+
+
 # ==================== nodriver 自动安装 ====================
 def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     """运行 pip install 命令
@@ -77,7 +86,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
         print(f"[BrowserCaptcha] 正在安装 {package}...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = _run_text_subprocess(cmd, timeout=300)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
             print(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -132,7 +141,7 @@ def _run_playwright_install(use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info("[BrowserCaptcha] 正在安装 chromium 浏览器...")
         print("[BrowserCaptcha] 正在安装 chromium 浏览器...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        result = _run_text_subprocess(cmd, timeout=600, env=env)
         if result.returncode == 0:
             debug_logger.log_info("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
             print("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
@@ -181,10 +190,8 @@ def _detect_playwright_browser_path() -> Optional[str]:
     env.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "0") or "0")
 
     try:
-        result = subprocess.run(
+        result = _run_text_subprocess(
             [sys.executable, "-c", detect_script],
-            capture_output=True,
-            text=True,
             timeout=60,
             env=env,
         )
@@ -558,7 +565,7 @@ class BrowserCaptchaService:
         self.headless = True  # 无头模式
         self.browser = None
         self._initialized = False
-        self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        self.website_key = getattr(config, "captcha_website_key", "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
         self.db = db
         # 使用 None 让 nodriver 自动创建临时目录，避免目录锁定问题
         self.user_data_dir = None
@@ -627,9 +634,11 @@ class BrowserCaptchaService:
         old_idle_ttl = self._idle_tab_ttl_seconds
         old_probe_ttl = self._health_probe_ttl_seconds
         old_fingerprint_ttl = self._fingerprint_cache_ttl_seconds
+        old_website_key = self.website_key
 
         self._max_resident_tabs = config.personal_max_resident_tabs
         self._idle_tab_ttl_seconds = config.personal_idle_tab_ttl_seconds
+        self.website_key = getattr(config, "captcha_website_key", self.website_key)
         self._refresh_runtime_tunables()
 
         debug_logger.log_info(
@@ -637,7 +646,8 @@ class BrowserCaptchaService:
             f"max_tabs {old_max_tabs}->{self._max_resident_tabs}, "
             f"idle_ttl {old_idle_ttl}s->{self._idle_tab_ttl_seconds}s, "
             f"probe_ttl {old_probe_ttl}s->{self._health_probe_ttl_seconds}s, "
-            f"fingerprint_ttl {old_fingerprint_ttl}s->{self._fingerprint_cache_ttl_seconds}s"
+            f"fingerprint_ttl {old_fingerprint_ttl}s->{self._fingerprint_cache_ttl_seconds}s, "
+            f"website_key {old_website_key[:8]}...->{self.website_key[:8]}..."
         )
 
     def _refresh_runtime_tunables(self):
@@ -1419,10 +1429,8 @@ class BrowserCaptchaService:
                         f"[BrowserCaptcha] 使用指定浏览器可执行文件: {browser_executable_path}"
                     )
                     try:
-                        version_result = subprocess.run(
+                        version_result = _run_text_subprocess(
                             [browser_executable_path, "--version"],
-                            capture_output=True,
-                            text=True,
                             timeout=10,
                         )
                         version_output = (
@@ -2019,6 +2027,28 @@ class BrowserCaptchaService:
         debug_logger.log_warning("[BrowserCaptcha] 自定义 reCAPTCHA 加载超时")
         return False
 
+    async def _wait_after_recaptcha_token(self, tab, token_kind: str = "reCAPTCHA") -> None:
+        """在 token 生成完成后额外等待一小段时间，降低上游立即校验失败概率。"""
+        post_wait_seconds = 3.0
+        try:
+            post_wait_seconds = float(getattr(config, "browser_recaptcha_settle_seconds", 3) or 3)
+        except Exception:
+            pass
+
+        if post_wait_seconds <= 0:
+            return
+
+        debug_logger.log_info(
+            f"[BrowserCaptcha] {token_kind} 已完成，额外等待 {post_wait_seconds:.1f}s 后返回 token"
+        )
+
+        sleep_method = getattr(tab, "sleep", None)
+        if callable(sleep_method):
+            await sleep_method(post_wait_seconds)
+            return
+
+        await asyncio.sleep(post_wait_seconds)
+
     async def _execute_recaptcha_on_tab(self, tab, action: str = "IMAGE_GENERATION") -> Optional[str]:
         """在指定标签页执行 reCAPTCHA 获取 token
 
@@ -2088,6 +2118,7 @@ class BrowserCaptchaService:
                 debug_logger.log_error(f"[BrowserCaptcha] reCAPTCHA 错误: {error}")
 
         if token:
+            await self._wait_after_recaptcha_token(tab, token_kind="企业版 reCAPTCHA")
             debug_logger.log_info(f"[BrowserCaptcha] ✅ Token 获取成功 (长度: {len(token)})")
         else:
             debug_logger.log_warning("[BrowserCaptcha] Token 获取失败，交由上层执行标签页恢复")
@@ -2167,16 +2198,7 @@ class BrowserCaptchaService:
             pass
 
         if token:
-            post_wait_seconds = 3
-            try:
-                post_wait_seconds = float(getattr(config, "browser_recaptcha_settle_seconds", 3) or 3)
-            except Exception:
-                pass
-            if post_wait_seconds > 0:
-                debug_logger.log_info(
-                    f"[BrowserCaptcha] 自定义 reCAPTCHA 已完成，额外等待 {post_wait_seconds:.1f}s 后返回 token"
-                )
-                await tab.sleep(post_wait_seconds)
+            await self._wait_after_recaptcha_token(tab, token_kind="自定义 reCAPTCHA")
 
         return token
 

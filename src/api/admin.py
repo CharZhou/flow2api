@@ -1529,6 +1529,7 @@ async def update_captcha_config(
     remote_browser_base_url = request.get("remote_browser_base_url")
     remote_browser_api_key = request.get("remote_browser_api_key")
     remote_browser_timeout = request.get("remote_browser_timeout", 60)
+    website_key = request.get("website_key")
     browser_proxy_enabled = request.get("browser_proxy_enabled", False)
     browser_proxy_url = request.get("browser_proxy_url", "")
     browser_count = request.get("browser_count", 1)
@@ -1572,6 +1573,7 @@ async def update_captcha_config(
         remote_browser_base_url=remote_browser_base_url,
         remote_browser_api_key=remote_browser_api_key,
         remote_browser_timeout=remote_browser_timeout,
+        website_key=website_key,
         browser_proxy_enabled=browser_proxy_enabled,
         browser_proxy_url=browser_proxy_url if browser_proxy_enabled else None,
         browser_count=max(1, int(browser_count)) if browser_count else 1,
@@ -1621,6 +1623,7 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "remote_browser_base_url": captcha_config.remote_browser_base_url,
         "remote_browser_api_key": captcha_config.remote_browser_api_key,
         "remote_browser_timeout": captcha_config.remote_browser_timeout,
+        "website_key": captcha_config.website_key,
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or "",
         "browser_count": captcha_config.browser_count,

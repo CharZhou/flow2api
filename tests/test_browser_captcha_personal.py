@@ -2,12 +2,14 @@ import types
 import unittest
 from unittest.mock import AsyncMock
 
+from src.core.config import config
 from src.services.browser_captcha_personal import BrowserCaptchaService, ResidentTabInfo
 
 
 class _FakeTab:
     def __init__(self, result):
         self._result = result
+        self.sleep = AsyncMock()
 
     async def evaluate(self, expression, await_promise=False, return_by_value=False):
         return self._result
@@ -50,6 +52,7 @@ class BrowserCaptchaPersonalTests(unittest.IsolatedAsyncioTestCase):
         token = await self.service._execute_recaptcha_on_tab(tab, action="IMAGE_GENERATION")
 
         self.assertEqual(token, "token-xyz")
+        tab.sleep.assert_awaited_once_with(config.browser_recaptcha_settle_seconds)
 
     async def test_create_resident_tab_returns_none_when_browser_missing(self):
         self.service.browser = None

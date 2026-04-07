@@ -122,11 +122,48 @@ class FlowClient:
         os_config = rng.choice(os_configs)
         browser_generator = rng.choice(os_config["browsers"])
         user_agent = browser_generator(rng)
+
+        # curl_cffi 的指纹当前主要走 Chromium 家族；这里尽量避免生成 Firefox/Safari UA，
+        # 否则请求头/TLS 指纹与声明的浏览器类型长期不一致，容易被上游识别为模拟线路。
+        if "Chrome/" not in user_agent and "Edg/" not in user_agent and "Chromium/" not in user_agent:
+            chrome_version = rng.choice(chrome_versions)
+            edge_version = rng.choice(edge_versions)
+            if "Windows" in os_config["platform"]:
+                user_agent = rng.choice([
+                    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36",
+                    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36 Edg/{edge_version}",
+                ])
+            elif "Macintosh" in os_config["platform"]:
+                user_agent = rng.choice([
+                    f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36",
+                    f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36 Edg/{edge_version}",
+                ])
+            else:
+                user_agent = rng.choice([
+                    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36",
+                    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36 Edg/{edge_version}",
+                ])
         
         # 缓存结果
         self._user_agent_cache[account_id] = user_agent
         
         return user_agent
+
+    def _guess_impersonate_from_user_agent(self, user_agent: Optional[str]) -> str:
+        """根据声明的 UA 选择尽量接近的 curl_cffi 指纹版本。"""
+        ua = (user_agent or "").strip()
+        major_match = re.search(r"(?:Chrome|Chromium|Edg|EdgA|EdgiOS)/(\d+)", ua)
+        if not major_match:
+            return "chrome120"
+
+        try:
+            major = int(major_match.group(1))
+        except Exception:
+            return "chrome120"
+
+        if major >= 124:
+            return "chrome124"
+        return "chrome120"
 
     def _set_request_fingerprint(self, fingerprint: Optional[Dict[str, Any]]):
         """设置当前请求链路的浏览器指纹上下文。"""
@@ -234,12 +271,14 @@ class FlowClient:
         for key, value in self._default_client_headers.items():
             headers.setdefault(key, value)
 
+        impersonate = self._guess_impersonate_from_user_agent(headers.get("User-Agent"))
+
         # Log request
         if config.debug_enabled:
             if isinstance(fingerprint, dict):
                 proxy_for_log = proxy_url if proxy_url else "direct"
                 debug_logger.log_info(
-                    f"[FINGERPRINT] 使用打码浏览器指纹提交请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
+                    f"[FINGERPRINT] 使用打码浏览器指纹提交请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}, impersonate={impersonate}"
                 )
             debug_logger.log_request(
                 method=method,
@@ -259,7 +298,7 @@ class FlowClient:
                         headers=headers,
                         proxy=proxy_url,
                         timeout=request_timeout,
-                        impersonate="chrome110"
+                        impersonate=impersonate
                     )
                 else:  # POST
                     response = await session.post(
@@ -268,7 +307,7 @@ class FlowClient:
                         json=json_data,
                         proxy=proxy_url,
                         timeout=request_timeout,
-                        impersonate="chrome110"
+                        impersonate=impersonate
                     )
 
                 duration_ms = (time.time() - start_time) * 1000
@@ -2438,7 +2477,7 @@ class FlowClient:
             debug_logger.log_info(f"[reCAPTCHA] {method} API key not configured, skipping")
             return None
 
-        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        website_key = getattr(config, "captcha_website_key", "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
         website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
         page_action = action
 

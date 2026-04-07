@@ -362,6 +362,22 @@ class Config:
         self._config["captcha"]["captcha_method"] = method
 
     @property
+    def captcha_website_key(self) -> str:
+        """Get reCAPTCHA website key."""
+        return self._config.get("captcha", {}).get(
+            "website_key",
+            "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV",
+        )
+
+    def set_captcha_website_key(self, website_key: str):
+        """Set reCAPTCHA website key."""
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["website_key"] = (
+            (website_key or "").strip() or "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+        )
+
+    @property
     def browser_launch_background(self) -> bool:
         """有头浏览器打码是否默认后台启动，避免抢占前台窗口。"""
         return self._config.get("captcha", {}).get("browser_launch_background", True)
