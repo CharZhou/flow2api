@@ -10,6 +10,7 @@ import signal
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
 import asyncio
+import json
 import time
 import re
 import random
@@ -387,6 +388,8 @@ class TokenBrowser:
         # Delay browser release after solve and track it by request_ref.
         self._pending_release_entries: Dict[str, Dict[str, Any]] = {}
         self._pending_release_lock = asyncio.Lock()
+        self._pending_request_pages: Dict[str, Any] = {}
+        self._pending_request_pages_lock = asyncio.Lock()
         # Browser mode keeps a shared in-memory browser instead of a persistent profile.
         self._shared_browser_lock = asyncio.Lock()
         self._shared_playwright = None
@@ -709,6 +712,8 @@ class TokenBrowser:
         self._shared_proxy_url = None
         self._consecutive_browser_failures = 0
         self._shared_reuse_count = 0
+        async with self._pending_request_pages_lock:
+            self._pending_request_pages.clear()
 
         if rotate_profile:
             self._refresh_browser_profile()
@@ -773,6 +778,34 @@ class TokenBrowser:
             self._shared_reuse_count = 0
             self.note_idle()
             return playwright, browser, context
+
+    async def _store_pending_request_page(self, page) -> str:
+        request_ref = uuid.uuid4().hex
+        async with self._pending_request_pages_lock:
+            self._pending_request_pages[request_ref] = page
+        return request_ref
+
+    async def _get_pending_request_page(self, request_ref: Optional[str] = None):
+        async with self._pending_request_pages_lock:
+            matched_ref = request_ref
+            page = None
+            if matched_ref and matched_ref in self._pending_request_pages:
+                page = self._pending_request_pages.get(matched_ref)
+            elif not matched_ref and self._pending_request_pages:
+                matched_ref = next(iter(self._pending_request_pages.keys()))
+                page = self._pending_request_pages.get(matched_ref)
+            return matched_ref, page
+
+    async def _pop_pending_request_page(self, request_ref: Optional[str] = None):
+        async with self._pending_request_pages_lock:
+            matched_ref = request_ref
+            page = None
+            if matched_ref and matched_ref in self._pending_request_pages:
+                page = self._pending_request_pages.pop(matched_ref, None)
+            elif not matched_ref and self._pending_request_pages:
+                matched_ref = next(iter(self._pending_request_pages.keys()))
+                page = self._pending_request_pages.pop(matched_ref, None)
+            return matched_ref, page
 
     async def _capture_page_fingerprint(self, page):
         """从浏览器页面提取 UA 与客户端提示头，确保与打码浏览器一致。"""
@@ -943,6 +976,99 @@ class TokenBrowser:
                 "page_url": last_snapshot.get("url") or "",
                 "error": last_snapshot.get("error") or "未在页面中读取到分数",
             },
+        }
+
+    async def submit_generation_request(
+        self,
+        request_ref: Optional[str],
+        url: str,
+        at_token: str,
+        json_data: Dict[str, Any],
+        timeout_seconds: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Use the same browser page that solved reCAPTCHA to submit the generation request."""
+        matched_ref, page = await self._get_pending_request_page(request_ref)
+        if page is None:
+            raise RuntimeError("No pending browser page available for generation submit")
+
+        request_body = json.dumps(json_data or {}, ensure_ascii=False, separators=(",", ":"))
+        timeout_ms = max(5000, int(float(timeout_seconds or 60.0) * 1000))
+
+        try:
+            result = await page.evaluate(
+                """
+                    async ({ url, body, authToken, timeoutMs }) => {
+                        const controller = new AbortController();
+                        const timer = setTimeout(() => controller.abort(new Error("timeout")), timeoutMs);
+                        try {
+                            const response = await fetch(url, {
+                                method: "POST",
+                                mode: "cors",
+                                credentials: "include",
+                                headers: {
+                                    "accept": "*/*",
+                                    "authorization": `Bearer ${authToken}`,
+                                    "content-type": "text/plain;charset=UTF-8",
+                                },
+                                body,
+                                signal: controller.signal,
+                            });
+                            const text = await response.text();
+                            const headers = {};
+                            response.headers.forEach((value, key) => {
+                                headers[key] = value;
+                            });
+                            return {
+                                ok: response.ok,
+                                status: response.status,
+                                text,
+                                headers,
+                            };
+                        } catch (error) {
+                            return {
+                                ok: false,
+                                status: 0,
+                                text: "",
+                                headers: {},
+                                networkError: error && error.message ? error.message : String(error || "fetch failed"),
+                            };
+                        } finally {
+                            clearTimeout(timer);
+                        }
+                    }
+                """,
+                {
+                    "url": url,
+                    "body": request_body,
+                    "authToken": at_token,
+                    "timeoutMs": timeout_ms,
+                },
+            )
+        except Exception as e:
+            raise RuntimeError(f"Browser submit failed: {type(e).__name__}: {e}") from e
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Browser submit returned invalid response payload")
+
+        if result.get("networkError"):
+            raise RuntimeError(f"Browser submit failed: {result['networkError']}")
+
+        status_code = int(result.get("status", 0) or 0)
+        response_text = result.get("text") or ""
+        response_headers = result.get("headers") if isinstance(result.get("headers"), dict) else {}
+        parsed = None
+        if response_text:
+            try:
+                parsed = json.loads(response_text)
+            except Exception:
+                parsed = None
+
+        return {
+            "request_ref": matched_ref,
+            "status_code": status_code,
+            "headers": response_headers,
+            "text": response_text,
+            "json": parsed,
         }
     
     async def _close_browser(
@@ -1118,9 +1244,17 @@ class TokenBrowser:
         if close_all:
             await self.recycle_browser(reason="force_close_all", rotate_profile=False)
 
-    async def _execute_captcha(self, context, project_id: str, website_key: str, action: str) -> Optional[str]:
+    async def _execute_captcha(
+        self,
+        context,
+        project_id: str,
+        website_key: str,
+        action: str,
+        keep_page_open: bool = False,
+    ) -> tuple[Optional[str], Optional[Any]]:
         """在给定 context 中执行打码逻辑"""
         page = None
+        retained_page = False
         try:
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
@@ -1153,7 +1287,7 @@ class TokenBrowser:
                     }})();
                     </script></head><body></body></html>"""
                     await route.fulfill(status=200, content_type="text/html", body=html)
-                elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net"]):
+                elif any(d in route.request.url for d in ["google.com", "gstatic.com", "recaptcha.net", "aisandbox-pa.googleapis.com"]):
                     await route.continue_()
                 else:
                     await route.abort()
@@ -1209,13 +1343,17 @@ class TokenBrowser:
                 )
                 await asyncio.sleep(post_wait_seconds)
 
-            return token
+            if keep_page_open and token:
+                retained_page = True
+                return token, page
+
+            return token, None
         except Exception as e:
             msg = f"{type(e).__name__}: {str(e)}"
             debug_logger.log_warning(f"[BrowserCaptcha] Token-{self.token_id} 打码失败: {msg[:200]}")
-            return None
+            return None, None
         finally:
-            if page:
+            if page and not retained_page:
                 try:
                     await page.close()
                 except:
@@ -1448,14 +1586,21 @@ class TokenBrowser:
                         start_ts = time.time()
                         _, _, context = await self._get_or_create_shared_browser(token_proxy_url=token_proxy_url)
 
-                        token = await self._execute_captcha(context, project_id, website_key, action)
+                        token, page = await self._execute_captcha(
+                            context,
+                            project_id,
+                            website_key,
+                            action,
+                            keep_page_open=True,
+                        )
                         if token:
                             self._solve_count += 1
                             self._consecutive_browser_failures = 0
+                            request_ref = await self._store_pending_request_page(page) if page else None
                             debug_logger.log_info(
                                 f"[BrowserCaptcha] Token-{self.token_id} token acquired ({(time.time()-start_ts)*1000:.0f}ms, launches={self._shared_launch_count}, reuse={self._shared_reuse_count})"
                             )
-                            return token, None
+                            return token, request_ref
 
                         self._error_count += 1
                         self._consecutive_browser_failures += 1
@@ -2036,6 +2181,33 @@ class BrowserCaptchaService:
                 return None
             return browser.get_last_fingerprint()
 
+    async def submit_generation_request(
+        self,
+        browser_ref: Optional[Union[int, str]],
+        url: str,
+        at_token: str,
+        json_data: Dict[str, Any],
+        timeout_seconds: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Submit a generation request from the same browser page that solved reCAPTCHA."""
+        browser_id, request_ref = self._parse_browser_ref(browser_ref)
+        if browser_id is None:
+            raise RuntimeError("Invalid browser reference for browser submit")
+
+        async with self._browsers_lock:
+            browser = self._browsers.get(browser_id)
+
+        if not browser:
+            raise RuntimeError(f"Browser slot not found: {browser_id}")
+
+        return await browser.submit_generation_request(
+            request_ref=request_ref,
+            url=url,
+            at_token=at_token,
+            json_data=json_data,
+            timeout_seconds=timeout_seconds,
+        )
+
     async def report_error(self, browser_ref: Optional[Union[int, str]] = None, error_reason: Optional[str] = None):
         """Handle upstream errors; recycle the browser only for explicit reCAPTCHA evaluation failures."""
         browser_id, _ = self._parse_browser_ref(browser_ref)
@@ -2067,7 +2239,7 @@ class BrowserCaptchaService:
 
     async def report_request_finished(self, browser_ref: Optional[Union[int, str]] = None):
         """上层通知本次请求已完成；browser 模式仅保留常驻浏览器，不在成功后主动关闭。"""
-        browser_id, _ = self._parse_browser_ref(browser_ref)
+        browser_id, request_ref = self._parse_browser_ref(browser_ref)
         if browser_id is None:
             return
 
@@ -2075,6 +2247,16 @@ class BrowserCaptchaService:
             browser = self._browsers.get(browser_id)
 
         if browser:
+            matched_ref, page = await browser._pop_pending_request_page(request_ref)
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] browser {browser_id} closed retained solve page "
+                    f"(request_ref={(matched_ref or 'unknown')[:8]})"
+                )
             keepalive_alive = False
             keepalive_page = getattr(browser, '_shared_keepalive_page', None)
             try:

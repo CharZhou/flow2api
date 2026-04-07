@@ -579,6 +579,7 @@ class FlowClient:
         at: str,
         attempt_trace: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
+        browser_ref: Optional[Union[int, str]] = None,
     ) -> Dict[str, Any]:
         """图片生成请求使用更短超时，并在网络超时时快速重试。"""
         request_timeout = config.flow_image_request_timeout
@@ -629,17 +630,37 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                result = await self._make_request(
-                    method="POST",
-                    url=url,
-                    headers=headers,
-                    json_data=json_data,
-                    use_at=True,
-                    at_token=at,
-                    timeout=request_timeout,
-                    use_media_proxy=prefer_media_proxy,
-                    respect_fingerprint_proxy=not prefer_media_proxy,
-                )
+                if config.captcha_method == "browser" and browser_ref and not prefer_media_proxy:
+                    from .browser_captcha import BrowserCaptchaService
+
+                    service = await BrowserCaptchaService.get_instance(self.db)
+                    browser_result = await service.submit_generation_request(
+                        browser_ref=browser_ref,
+                        url=url,
+                        at_token=at,
+                        json_data=json_data,
+                        timeout_seconds=request_timeout,
+                    )
+                    status_code = int(browser_result.get("status_code", 0) or 0)
+                    response_text = browser_result.get("text") or ""
+                    if status_code >= 400:
+                        error_reason = self._build_http_error_reason(status_code, response_text)
+                        raise Exception(error_reason)
+                    result = browser_result.get("json")
+                    if not isinstance(result, dict):
+                        raise Exception(f"Invalid JSON response: {response_text[:200]}")
+                else:
+                    result = await self._make_request(
+                        method="POST",
+                        url=url,
+                        headers=headers,
+                        json_data=json_data,
+                        use_at=True,
+                        at_token=at,
+                        timeout=request_timeout,
+                        use_media_proxy=prefer_media_proxy,
+                        respect_fingerprint_proxy=not prefer_media_proxy,
+                    )
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = True
@@ -674,6 +695,25 @@ class FlowClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError("图片生成请求失败")
+
+    def _build_http_error_reason(self, status_code: int, response_text: str) -> str:
+        """Parse upstream HTTP errors into the same reason format used by curl_cffi requests."""
+        error_reason = f"HTTP Error {status_code}"
+        try:
+            error_body = json.loads(response_text or "{}")
+            if "error" in error_body:
+                error_info = error_body["error"]
+                error_message = error_info.get("message", "")
+                details = error_info.get("details", [])
+                for detail in details:
+                    if isinstance(detail, dict) and detail.get("reason"):
+                        error_reason = detail.get("reason")
+                        break
+                if error_message:
+                    error_reason = f"{error_reason}: {error_message}"
+        except Exception:
+            error_reason = f"HTTP Error {status_code}: {(response_text or '')[:200]}"
+        return error_reason
 
     # ========== 认证相关 (使用ST) ==========
 
@@ -1140,6 +1180,7 @@ class FlowClient:
                     at=at,
                     attempt_trace=attempt_trace,
                     headers=self._build_generation_request_headers(),
+                    browser_ref=browser_id,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)

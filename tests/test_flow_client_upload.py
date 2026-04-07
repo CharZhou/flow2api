@@ -1,4 +1,6 @@
 import unittest
+import sys
+import types
 from unittest.mock import AsyncMock
 
 from src.core.config import config
@@ -115,6 +117,48 @@ class FlowClientCaptchaActionTests(unittest.TestCase):
         finally:
             config.set_captcha_page_action(old_page_action)
             config.set_captcha_video_page_action(old_video_page_action)
+
+
+class FlowClientBrowserSubmitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_generation_prefers_browser_submit_in_browser_mode(self):
+        client = FlowClient(proxy_manager=None, db=object())
+        old_captcha_method = config.captcha_method
+        config.set_captcha_method("browser")
+
+        service = types.SimpleNamespace()
+        service.submit_generation_request = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "text": '{"ok": true}',
+                "json": {"ok": True},
+            }
+        )
+        fake_module = types.SimpleNamespace(
+            BrowserCaptchaService=types.SimpleNamespace(
+                get_instance=AsyncMock(return_value=service)
+            )
+        )
+        original_module = sys.modules.get("src.services.browser_captcha")
+
+        try:
+            sys.modules["src.services.browser_captcha"] = fake_module
+
+            result = await client._make_image_generation_request(
+                url="https://example.com/flowMedia:batchGenerateImages",
+                json_data={"foo": "bar"},
+                at="test-at",
+                headers=client._build_generation_request_headers(),
+                browser_ref="0:req-1",
+            )
+
+            self.assertEqual(result, {"ok": True})
+            service.submit_generation_request.assert_awaited_once()
+        finally:
+            config.set_captcha_method(old_captcha_method)
+            if original_module is None:
+                sys.modules.pop("src.services.browser_captcha", None)
+            else:
+                sys.modules["src.services.browser_captcha"] = original_module
 
 
 if __name__ == "__main__":
